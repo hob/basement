@@ -84,47 +84,63 @@ func scanAndReportMissingFiles(networkDir string, localFiles map[string]bool) er
 	if err := csvWriter.Write(header); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}
+	missingFiles, err := scanForMissingFiles(networkDir, localFiles, make([]os.FileInfo, 0))
+	if err != nil {
+		return fmt.Errorf("error scanning for missing files: %w", err)
+	}
+	if len(missingFiles) == 0 {
+		fmt.Println("-> No new files found.")
+	} else {
+		for _, info := range missingFiles {
+			fileName := info.Name()
+			path := filepath.Join(networkDir, fileName)
+			record := []string{
+				fileName,
+				path,
+				strconv.FormatInt(info.Size(), 10),
+				info.ModTime().UTC().Format(time.RFC3339),
+			}
 
-	var filesFound int
-	err = filepath.Walk(networkDir, func(path string, info os.FileInfo, err error) error {
+			if err := csvWriter.Write(record); err != nil {
+				log.Printf("   Warning: Failed to write record for %s to CSV: %v", fileName, err)
+			}
+
+			// Add the file to our map so we don't write duplicate rows if it's found again.
+			localFiles[fileName] = true
+
+		}
+		fmt.Printf("\nReport generated: %s\n", outputFileName)
+	}
+
+	return nil
+}
+
+func scanForMissingFiles(networkDir string, localFiles map[string]bool, missingFiles []os.FileInfo) ([]os.FileInfo, error) {
+	err := filepath.Walk(networkDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Warning: error accessing path %q: %v\n", path, err)
 			return nil
 		}
 
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".mkv") {
+		if info.IsDir() {
+			if path != networkDir {
+				missingFiles, err = scanForMissingFiles(path, localFiles, missingFiles)
+				if err != nil {
+					return err
+				}
+			}
+		} else if strings.HasSuffix(strings.ToLower(info.Name()), ".mkv") {
 			fileName := info.Name()
 			if !localFiles[fileName] {
-				filesFound++
 				fmt.Printf("-> Found missing file: %s\n", fileName)
-
-				record := []string{
-					fileName,
-					path,
-					strconv.FormatInt(info.Size(), 10),
-					info.ModTime().UTC().Format(time.RFC3339),
-				}
-
-				if err := csvWriter.Write(record); err != nil {
-					log.Printf("   Warning: Failed to write record for %s to CSV: %v", fileName, err)
-				}
-
-				// Add the file to our map so we don't write duplicate rows if it's found again.
-				localFiles[fileName] = true
+				missingFiles = append(missingFiles, info)
 			}
 		}
 		return nil
 	})
 
 	if err != nil {
-		return fmt.Errorf("error walking directory %s: %w", networkDir, err)
+		return nil, fmt.Errorf("error walking directory %s: %w", networkDir, err)
 	}
-
-	if filesFound == 0 {
-		fmt.Println("-> No new files found.")
-	} else {
-		fmt.Printf("\nReport generated: %s\n", outputFileName)
-	}
-
-	return nil
+	return missingFiles, nil
 }
