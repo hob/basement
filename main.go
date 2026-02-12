@@ -30,7 +30,7 @@ func main() {
 	fmt.Printf("-> Found %d local .mkv files.\n\n", len(localFiles))
 
 	fmt.Println("Step 2: Scanning network drive for missing files...")
-	err = scanAndReportMissingFiles(*networkDir, localFiles)
+	err = scanAndReportMissingFiles(*networkDir, &localFiles)
 	if err != nil {
 		log.Fatalf("Error scanning network drive '%s': %v", *networkDir, err)
 	}
@@ -44,7 +44,6 @@ func indexMkvFiles(dir string) (map[string]bool, error) {
 }
 
 func _indexMkvFiles(dir string, files map[string]bool) (map[string]bool, error) {
-	log.Printf("Walking directory: %s", dir)
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			// Don't stop for single file errors, just log them.
@@ -68,7 +67,7 @@ func _indexMkvFiles(dir string, files map[string]bool) (map[string]bool, error) 
 
 // scanAndReportMissingFiles walks the network directory, and if a .mkv file is not
 // in the localFiles map, it writes its details to missing_files.csv.
-func scanAndReportMissingFiles(networkDir string, localFiles map[string]bool) error {
+func scanAndReportMissingFiles(networkDir string, localFiles *map[string]bool) error {
 	outputFileName := "missing_files.csv"
 	csvFile, err := os.Create(outputFileName)
 	if err != nil {
@@ -84,7 +83,8 @@ func scanAndReportMissingFiles(networkDir string, localFiles map[string]bool) er
 	if err := csvWriter.Write(header); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}
-	missingFiles, err := scanForMissingFiles(networkDir, localFiles, make([]os.FileInfo, 0))
+	missingFiles := make([]os.FileInfo, 0)
+	err = scanForMissingFiles(networkDir, localFiles, &missingFiles)
 	if err != nil {
 		return fmt.Errorf("error scanning for missing files: %w", err)
 	}
@@ -106,7 +106,7 @@ func scanAndReportMissingFiles(networkDir string, localFiles map[string]bool) er
 			}
 
 			// Add the file to our map so we don't write duplicate rows if it's found again.
-			localFiles[fileName] = true
+			(*localFiles)[fileName] = true
 
 		}
 		fmt.Printf("\nReport generated: %s\n", outputFileName)
@@ -115,7 +115,7 @@ func scanAndReportMissingFiles(networkDir string, localFiles map[string]bool) er
 	return nil
 }
 
-func scanForMissingFiles(networkDir string, localFiles map[string]bool, missingFiles []os.FileInfo) ([]os.FileInfo, error) {
+func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missingFiles *[]os.FileInfo) error {
 	err := filepath.Walk(networkDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Warning: error accessing path %q: %v\n", path, err)
@@ -124,23 +124,23 @@ func scanForMissingFiles(networkDir string, localFiles map[string]bool, missingF
 
 		if info.IsDir() {
 			if path != networkDir {
-				missingFiles, err = scanForMissingFiles(path, localFiles, missingFiles)
-				if err != nil {
-					return err
-				}
+				// Recursively scan subdirectories
+				return scanForMissingFiles(path, localFiles, missingFiles)
 			}
 		} else if strings.HasSuffix(strings.ToLower(info.Name()), ".mkv") {
 			fileName := info.Name()
-			if !localFiles[fileName] {
+			if !(*localFiles)[fileName] {
 				fmt.Printf("-> Found missing file: %s\n", fileName)
-				missingFiles = append(missingFiles, info)
+				*missingFiles = append(*missingFiles, info)
+				// Add the file to the localFiles map to prevent duplicates
+				(*localFiles)[fileName] = true
 			}
 		}
 		return nil
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("error walking directory %s: %w", networkDir, err)
+		return fmt.Errorf("error walking directory %s: %w", networkDir, err)
 	}
-	return missingFiles, nil
+	return nil
 }
