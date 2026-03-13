@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"charm.land/huh/v2"
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -30,12 +33,25 @@ func main() {
 	fmt.Printf("-> Found %d local .mkv files.\n\n", len(localFiles))
 
 	fmt.Println("Step 2: Scanning network drive for missing files...")
-	err = scanAndReportMissingFiles(*networkDir, &localFiles)
+	missingFiles, err := scanAndReportMissingFiles(*networkDir, &localFiles)
 	if err != nil {
 		log.Fatalf("Error scanning network drive '%s': %v", *networkDir, err)
 	}
 
+	if len(missingFiles) > 0 {
+		selected := promptForSelection(missingFiles)
+		if len(selected) > 0 {
+			copySelectedToLocal(selected, *localDir)
+		}
+	}
+
 	fmt.Println("\nScan complete.")
+}
+
+// missingFile holds the full source path and file info for a missing file.
+type missingFile struct {
+	Path string
+	Info os.FileInfo
 }
 
 // indexMkvFiles walks the given directory and creates a set of all .mkv filenames.
@@ -66,12 +82,12 @@ func _indexMkvFiles(dir string, files map[string]bool) (map[string]bool, error) 
 }
 
 // scanAndReportMissingFiles walks the network directory, and if a .mkv file is not
-// in the localFiles map, it writes its details to missing_files.csv.
-func scanAndReportMissingFiles(networkDir string, localFiles *map[string]bool) error {
+// in the localFiles map, it writes its details to missing_files.csv and returns the list.
+func scanAndReportMissingFiles(networkDir string, localFiles *map[string]bool) ([]missingFile, error) {
 	outputFileName := "missing_files.csv"
 	csvFile, err := os.Create(outputFileName)
 	if err != nil {
-		return fmt.Errorf("failed to create output file %s: %w", outputFileName, err)
+		return nil, fmt.Errorf("failed to create output file %s: %w", outputFileName, err)
 	}
 	defer csvFile.Close()
 
@@ -81,24 +97,23 @@ func scanAndReportMissingFiles(networkDir string, localFiles *map[string]bool) e
 	// Write CSV Header
 	header := []string{"Filename", "SourcePath", "Size(Bytes)", "ModifiedTime"}
 	if err := csvWriter.Write(header); err != nil {
-		return fmt.Errorf("failed to write CSV header: %w", err)
+		return nil, fmt.Errorf("failed to write CSV header: %w", err)
 	}
-	missingFiles := make([]os.FileInfo, 0)
-	err = scanForMissingFiles(networkDir, localFiles, &missingFiles)
+	missing := make([]missingFile, 0)
+	err = scanForMissingFiles(networkDir, localFiles, &missing)
 	if err != nil {
-		return fmt.Errorf("error scanning for missing files: %w", err)
+		return nil, fmt.Errorf("error scanning for missing files: %w", err)
 	}
-	if len(missingFiles) == 0 {
+	if len(missing) == 0 {
 		fmt.Println("-> No new files found.")
 	} else {
-		for _, info := range missingFiles {
-			fileName := info.Name()
-			path := filepath.Join(networkDir, fileName)
+		for _, m := range missing {
+			fileName := m.Info.Name()
 			record := []string{
 				fileName,
-				path,
-				strconv.FormatInt(info.Size(), 10),
-				info.ModTime().UTC().Format(time.RFC3339),
+				m.Path,
+				strconv.FormatInt(m.Info.Size(), 10),
+				m.Info.ModTime().UTC().Format(time.RFC3339),
 			}
 
 			if err := csvWriter.Write(record); err != nil {
@@ -107,15 +122,14 @@ func scanAndReportMissingFiles(networkDir string, localFiles *map[string]bool) e
 
 			// Add the file to our map so we don't write duplicate rows if it's found again.
 			(*localFiles)[fileName] = true
-
 		}
 		fmt.Printf("\nReport generated: %s\n", outputFileName)
 	}
 
-	return nil
+	return missing, nil
 }
 
-func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missingFiles *[]os.FileInfo) error {
+func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missing *[]missingFile) error {
 	err := filepath.Walk(networkDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Warning: error accessing path %q: %v\n", path, err)
@@ -125,13 +139,13 @@ func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missing
 		if info.IsDir() {
 			if path != networkDir {
 				// Recursively scan subdirectories
-				return scanForMissingFiles(path, localFiles, missingFiles)
+				return scanForMissingFiles(path, localFiles, missing)
 			}
 		} else if strings.HasSuffix(strings.ToLower(info.Name()), ".mkv") {
 			fileName := info.Name()
 			if !(*localFiles)[fileName] {
 				fmt.Printf("-> Found missing file: %s\n", fileName)
-				*missingFiles = append(*missingFiles, info)
+				*missing = append(*missing, missingFile{Path: path, Info: info})
 				// Add the file to the localFiles map to prevent duplicates
 				(*localFiles)[fileName] = true
 			}
@@ -143,4 +157,125 @@ func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missing
 		return fmt.Errorf("error walking directory %s: %w", networkDir, err)
 	}
 	return nil
+}
+
+// promptForSelection shows a checkbox list (whiptail-style) of missing files and returns the selected subset.
+// Uses Charm huh for an interactive TUI; falls back to text prompt when not a terminal.
+func promptForSelection(missing []missingFile) []missingFile {
+	if len(missing) == 0 {
+		return nil
+	}
+	// Prefer checkbox TUI when stdin is a terminal
+	if isTerminal(os.Stdin) {
+		return promptForSelectionTUI(missing)
+	}
+	return promptForSelectionText(missing)
+}
+
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) == os.ModeCharDevice
+}
+
+func promptForSelectionTUI(missing []missingFile) []missingFile {
+	opts := make([]huh.Option[int], 0, len(missing))
+	for i, m := range missing {
+		label := fmt.Sprintf("%s  (%s)", m.Info.Name(), formatSize(m.Info.Size()))
+		opts = append(opts, huh.NewOption(label, i))
+	}
+	var selectedIndices []int
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewMultiSelect[int]().
+				Title("Select files to copy to local (space to toggle, enter to confirm)").
+				Options(opts...).
+				Height(min(12, len(missing)+2)).
+				Value(&selectedIndices),
+		),
+	)
+	if err := form.Run(); err != nil {
+		log.Printf("TUI prompt failed (use a terminal for checkboxes): %v", err)
+		return promptForSelectionText(missing)
+	}
+	result := make([]missingFile, 0, len(selectedIndices))
+	for _, i := range selectedIndices {
+		result = append(result, missing[i])
+	}
+	return result
+}
+
+func promptForSelectionText(missing []missingFile) []missingFile {
+	fmt.Println("\nMissing files - which do you want to copy to local?")
+	for i, m := range missing {
+		fmt.Printf("  %d) %s (%s)\n", i+1, m.Info.Name(), formatSize(m.Info.Size()))
+	}
+	fmt.Print("Enter numbers (e.g. 1,3,5), 'all', or 'none': ")
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("Failed to read input: %v", err)
+		return nil
+	}
+	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "" || line == "none" {
+		return nil
+	}
+	if line == "all" {
+		return missing
+	}
+	var selected []missingFile
+	for _, s := range strings.Split(line, ",") {
+		s = strings.TrimSpace(s)
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > len(missing) {
+			log.Printf("Skipping invalid selection: %q", s)
+			continue
+		}
+		selected = append(selected, missing[n-1])
+	}
+	return selected
+}
+
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// copySelectedToLocal copies the selected missing files to localDir.
+func copySelectedToLocal(selected []missingFile, localDir string) {
+	for _, m := range selected {
+		dest := filepath.Join(localDir, m.Info.Name())
+		fmt.Printf("Copying %s -> %s ... ", m.Info.Name(), dest)
+		srcFile, err := os.Open(m.Path)
+		if err != nil {
+			log.Printf("failed to open source: %v", err)
+			continue
+		}
+		destFile, err := os.Create(dest)
+		if err != nil {
+			srcFile.Close()
+			log.Printf("failed to create destination: %v", err)
+			continue
+		}
+		_, err = io.Copy(destFile, srcFile)
+		srcFile.Close()
+		destFile.Close()
+		if err != nil {
+			log.Printf("copy failed: %v", err)
+			os.Remove(dest)
+			continue
+		}
+		fmt.Println("done.")
+	}
 }
