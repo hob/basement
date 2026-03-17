@@ -18,11 +18,18 @@ import (
 func main() {
 	localDir := flag.String("local", "", "Path to the local directory to store mkv files.")
 	networkDir := flag.String("remote", "", "Path to the network drive to scan for mkv files.")
+	targetDir := flag.String("target", "", "Optional path to store copied mkv files (defaults to --local).")
 	flag.Parse()
 
 	if *localDir == "" || *networkDir == "" {
-		fmt.Println("Usage: mkv-sync --local <your-local-mkv-directory> --remote <network-drive-path>")
-		log.Fatal("Both --local and --remote directory paths are required.")
+		fmt.Println("Usage: mkv-sync --local <your-local-mkv-directory> --remote <network-drive-path> [--target <copy-destination>]")
+		log.Fatal("Both --local and --remote directory paths are required. --target is optional and defaults to --local.")
+	}
+
+	// Default target directory to the local directory when not explicitly provided.
+	effectiveTargetDir := *targetDir
+	if strings.TrimSpace(effectiveTargetDir) == "" {
+		effectiveTargetDir = *localDir
 	}
 
 	fmt.Println("Step 1: Indexing local files...")
@@ -41,7 +48,7 @@ func main() {
 	if len(missingFiles) > 0 {
 		selected := promptForSelection(missingFiles)
 		if len(selected) > 0 {
-			copySelectedToLocal(selected, *localDir)
+			copySelectedToLocal(selected, effectiveTargetDir)
 		}
 	}
 
@@ -252,10 +259,10 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// copySelectedToLocal copies the selected missing files to localDir.
-func copySelectedToLocal(selected []missingFile, localDir string) {
+// copySelectedToLocal copies the selected missing files to targetDir.
+func copySelectedToLocal(selected []missingFile, targetDir string) {
 	for _, m := range selected {
-		dest := filepath.Join(localDir, m.Info.Name())
+		dest := filepath.Join(targetDir, m.Info.Name())
 		fmt.Printf("Copying %s -> %s ... ", m.Info.Name(), dest)
 		srcFile, err := os.Open(m.Path)
 		if err != nil {
