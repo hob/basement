@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,11 +20,23 @@ func main() {
 	localDir := flag.String("local", "", "Path to the local directory to store mkv files.")
 	networkDir := flag.String("remote", "", "Path to the network drive to scan for mkv files.")
 	targetDir := flag.String("target", "", "Optional path to store copied mkv files (defaults to --local).")
+	report := flag.Bool("report", false, "Generate CSV report of all local .mkv files (requires --local, ignores --remote).")
 	flag.Parse()
+
+	if *report {
+		if *localDir == "" {
+			fmt.Println("Usage (report mode): mkv-sync --local <your-local-mkv-directory> --report")
+			log.Fatal("--local directory path is required when using --report.")
+		}
+		if err := generateLocalReport(*localDir); err != nil {
+			log.Fatalf("Error generating report for local directory '%s': %v", *localDir, err)
+		}
+		return
+	}
 
 	if *localDir == "" || *networkDir == "" {
 		fmt.Println("Usage: mkv-sync --local <your-local-mkv-directory> --remote <network-drive-path> [--target <copy-destination>]")
-		log.Fatal("Both --local and --remote directory paths are required. --target is optional and defaults to --local.")
+		log.Fatal("Both --local and --remote directory paths are required unless --report is used. --target is optional and defaults to --local.")
 	}
 
 	// Default target directory to the local directory when not explicitly provided.
@@ -53,6 +66,107 @@ func main() {
 	}
 
 	fmt.Println("\nScan complete.")
+}
+
+// generateLocalReport walks the local directory and writes a CSV report of all .mkv files found.
+func generateLocalReport(localDir string) error {
+	outputFileName := "all_mkv_files.csv"
+	csvFile, err := os.Create(outputFileName)
+	if err != nil {
+		return fmt.Errorf("failed to create output file %s: %w", outputFileName, err)
+	}
+	defer csvFile.Close()
+
+	csvWriter := csv.NewWriter(csvFile)
+	defer csvWriter.Flush()
+
+	header := []string{
+		"Series",
+		"Title",
+		"Year",
+		"Extra",
+	}
+	if err := csvWriter.Write(header); err != nil {
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	count := 0
+	err = filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("Warning: error accessing path %q: %v\n", path, err)
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(info.Name()), ".mkv") {
+			return nil
+		}
+
+		meta := parseMovieMetadataFromFilename(info.Name())
+		record := []string{
+			meta.Series,
+			meta.Title,
+			meta.Year,
+			meta.Extra,
+		}
+		if err := csvWriter.Write(record); err != nil {
+			log.Printf("Warning: failed to write record for %s to CSV: %v", info.Name(), err)
+			return nil
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error walking directory %s: %w", localDir, err)
+	}
+
+	if count == 0 {
+		fmt.Println("No .mkv files found in local directory.")
+	} else {
+		fmt.Printf("Report generated: %s (%d files)\n", outputFileName, count)
+	}
+
+	return nil
+}
+
+type movieMetadata struct {
+	Series       string
+	Title        string
+	Year         string
+	Extra        string
+}
+
+func parseMovieMetadataFromFilename(filename string) movieMetadata {
+	// Strip extension
+	base := strings.TrimSpace(strings.TrimSuffix(filename, filepath.Ext(filename)))
+	meta := movieMetadata{}
+
+	// First pass: parse "Series - Title (Year) Extra" style using " - " separators
+	// (keeps hyphens inside titles, e.g. "Extra-Terrestrial").
+	parts := strings.Split(base, " - ")
+	primary := base
+	if len(parts) >= 2 {
+		meta.Series = strings.TrimSpace(parts[0])
+		primary = strings.TrimSpace(strings.Join(parts[1:], " - "))
+	}
+
+	yearRE := regexp.MustCompile(`\((\d{4})\)`)
+	if m := yearRE.FindStringSubmatchIndex(primary); len(m) > 0 {
+		meta.Year = primary[m[2]:m[3]]
+		before := strings.TrimSpace(primary[:m[0]])
+		after := strings.TrimSpace(primary[m[1]:])
+		meta.Title = before
+		meta.Extra = strings.TrimSpace(strings.TrimPrefix(after, "-"))
+	} else {
+		meta.Title = strings.TrimSpace(primary)
+	}
+
+	// Final fallbacks
+	if meta.Title == "" {
+		meta.Title = base
+	}
+	return meta
 }
 
 // missingFile holds the full source path and file info for a missing file.
