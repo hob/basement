@@ -16,9 +16,9 @@ This Go program helps you synchronize your Matroska video files (`.mkv`) from a 
 Navigate to the project's root directory in your terminal (where `main.go` is located) and run the following command to compile the program:
 
 ```bash
-go build -o mkv-sync .
+go build -o basement .
 ```
-This will create an executable file named `mkv-sync` (or `mkv-sync.exe` on Windows) in the current directory.
+This will create an executable file named `basement` (or `basement.exe` on Windows) in the current directory.
 
 ### 2. Run the Program
 
@@ -27,13 +27,13 @@ Execute the program with the `--local` and `--remote` flags, specifying your loc
 **Example (Windows):**
 
 ```bash
-.\mkv-sync.exe --local "C:\Users\YourUser\Videos\Movies" --remote \\NetworkShare\Media\Movies
+.\basement.exe --local "C:\Users\YourUser\Videos\Movies" --remote \\NetworkShare\Media\Movies
 ```
 
 **Example (Linux/macOS):**
 
 ```bash
-./mkv-sync --local "/home/youruser/Videos/Movies" --remote "/mnt/network/Media/Movies"
+./basement --local "/home/youruser/Videos/Movies" --remote "/mnt/network/Media/Movies"
 ```
 
 #### Command-Line Flags:
