@@ -37,7 +37,7 @@ func SyncMissing(localDir, networkDir, targetDir string, preserveStructure bool)
 	}
 
 	if len(missingFiles) > 0 {
-		selected := promptForSelection(missingFiles)
+		selected := promptForSelection(missingFiles, networkDir)
 		if len(selected) > 0 {
 			copySelectedToLocal(selected, targetDir, networkDir, preserveStructure)
 		}
@@ -155,15 +155,15 @@ func scanForMissingFiles(networkDir string, localFiles *map[string]bool, missing
 
 // promptForSelection shows a checkbox list (whiptail-style) of missing files and returns the selected subset.
 // Uses Charm huh for an interactive TUI; falls back to text prompt when not a terminal.
-func promptForSelection(missing []missingFile) []missingFile {
+func promptForSelection(missing []missingFile, networkDir string) []missingFile {
 	if len(missing) == 0 {
 		return nil
 	}
 	// Prefer checkbox TUI when stdin is a terminal
 	if isTerminal(os.Stdin) {
-		return promptForSelectionTUI(missing)
+		return promptForSelectionTUI(missing, networkDir)
 	}
-	return promptForSelectionText(missing)
+	return promptForSelectionText(missing, networkDir)
 }
 
 func isTerminal(f *os.File) bool {
@@ -174,37 +174,41 @@ func isTerminal(f *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) == os.ModeCharDevice
 }
 
-func promptForSelectionTUI(missing []missingFile) []missingFile {
-	opts := make([]huh.Option[int], 0, len(missing))
-	for i, m := range missing {
-		label := fmt.Sprintf("%s  (%s)", m.Info.Name(), formatSize(m.Info.Size()))
-		opts = append(opts, huh.NewOption(label, i))
+type treeChoice struct {
+	Key         string
+	Label       string
+	FileIndices []int
+}
+
+func promptForSelectionTUI(missing []missingFile, networkDir string) []missingFile {
+	choices := buildTreeChoices(missing, networkDir)
+	opts := make([]huh.Option[string], 0, len(choices))
+	for _, c := range choices {
+		opts = append(opts, huh.NewOption(c.Label, c.Key))
 	}
-	var selectedIndices []int
+
+	var selectedKeys []string
 	form := huh.NewForm(
 		huh.NewGroup(
-			huh.NewMultiSelect[int]().
+			huh.NewMultiSelect[string]().
 				Title("Select files to copy to local (space to toggle, enter to confirm)").
 				Options(opts...).
-				Height(min(12, len(missing)+2)).
-				Value(&selectedIndices),
+				Height(min(16, len(choices)+2)).
+				Value(&selectedKeys),
 		),
 	)
 	if err := form.Run(); err != nil {
 		log.Printf("TUI prompt failed (use a terminal for checkboxes): %v", err)
-		return promptForSelectionText(missing)
+		return promptForSelectionText(missing, networkDir)
 	}
-	result := make([]missingFile, 0, len(selectedIndices))
-	for _, i := range selectedIndices {
-		result = append(result, missing[i])
-	}
-	return result
+	return resolveTreeSelection(missing, choices, selectedKeys)
 }
 
-func promptForSelectionText(missing []missingFile) []missingFile {
+func promptForSelectionText(missing []missingFile, networkDir string) []missingFile {
 	fmt.Println("\nMissing files - which do you want to copy to local?")
-	for i, m := range missing {
-		fmt.Printf("  %d) %s (%s)\n", i+1, m.Info.Name(), formatSize(m.Info.Size()))
+	choices := buildTreeChoices(missing, networkDir)
+	for i, c := range choices {
+		fmt.Printf("  %d) %s\n", i+1, c.Label)
 	}
 	fmt.Print("Enter numbers (e.g. 1,3,5), 'all', or 'none': ")
 	reader := bufio.NewReader(os.Stdin)
@@ -220,17 +224,17 @@ func promptForSelectionText(missing []missingFile) []missingFile {
 	if line == "all" {
 		return missing
 	}
-	var selected []missingFile
+	selectedKeys := make([]string, 0)
 	for _, s := range strings.Split(line, ",") {
 		s = strings.TrimSpace(s)
 		n, err := strconv.Atoi(s)
-		if err != nil || n < 1 || n > len(missing) {
+		if err != nil || n < 1 || n > len(choices) {
 			log.Printf("Skipping invalid selection: %q", s)
 			continue
 		}
-		selected = append(selected, missing[n-1])
+		selectedKeys = append(selectedKeys, choices[n-1].Key)
 	}
-	return selected
+	return resolveTreeSelection(missing, choices, selectedKeys)
 }
 
 func formatSize(bytes int64) string {
@@ -244,6 +248,161 @@ func formatSize(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+type treeNode struct {
+	Name        string
+	Children    map[string]*treeNode
+	FileIndices []int
+}
+
+func buildTreeChoices(missing []missingFile, networkDir string) []treeChoice {
+	root := &treeNode{Name: "", Children: map[string]*treeNode{}}
+
+	// Build tree from file paths relative to the network root.
+	for i, m := range missing {
+		rel := m.Path
+		if networkDir != "" {
+			if r, err := filepath.Rel(networkDir, m.Path); err == nil {
+				rel = r
+			}
+		}
+		rel = filepath.Clean(rel)
+		dir := filepath.Dir(rel)
+		if dir == "." {
+			dir = ""
+		}
+		parts := []string{}
+		if dir != "" {
+			parts = strings.Split(dir, string(os.PathSeparator))
+		}
+
+		n := root
+		for _, p := range parts {
+			if p == "" || p == "." {
+				continue
+			}
+			if n.Children == nil {
+				n.Children = map[string]*treeNode{}
+			}
+			if _, ok := n.Children[p]; !ok {
+				n.Children[p] = &treeNode{Name: p, Children: map[string]*treeNode{}}
+			}
+			n = n.Children[p]
+		}
+		n.FileIndices = append(n.FileIndices, i)
+	}
+
+	choices := make([]treeChoice, 0, len(missing))
+	var walk func(n *treeNode, pathParts []string, depth int)
+	walk = func(n *treeNode, pathParts []string, depth int) {
+		// Add a selectable folder entry (except the root).
+		if depth > 0 {
+			folderPath := filepath.Join(pathParts...)
+			choices = append(choices, treeChoice{
+				Key:         "dir:" + folderPath,
+				Label:       fmt.Sprintf("%s%s%c", strings.Repeat("  ", depth-1), "▸ ", os.PathSeparator),
+				FileIndices: collectAllFileIndices(n),
+			})
+			// Replace the placeholder folder label with something readable including name.
+			choices[len(choices)-1].Label = fmt.Sprintf("%s📁 %s%c (%d)", strings.Repeat("  ", depth-1), n.Name, os.PathSeparator, len(choices[len(choices)-1].FileIndices))
+		}
+
+		// Recurse into child folders (sorted).
+		if len(n.Children) > 0 {
+			names := make([]string, 0, len(n.Children))
+			for name := range n.Children {
+				names = append(names, name)
+			}
+			sortStrings(names)
+			for _, name := range names {
+				walk(n.Children[name], append(pathParts, name), depth+1)
+			}
+		}
+
+		// Add selectable files that live directly in this folder (sorted by filename).
+		if len(n.FileIndices) > 0 {
+			fileIdx := append([]int(nil), n.FileIndices...)
+			sortIntsByFileName(fileIdx, missing)
+			for _, idx := range fileIdx {
+				m := missing[idx]
+				display := fmt.Sprintf("%s%s (%s)", strings.Repeat("  ", depth), m.Info.Name(), formatSize(m.Info.Size()))
+				if depth == 0 {
+					display = fmt.Sprintf("%s (%s)", m.Info.Name(), formatSize(m.Info.Size()))
+				}
+				choices = append(choices, treeChoice{
+					Key:         fmt.Sprintf("file:%d", idx),
+					Label:       display,
+					FileIndices: []int{idx},
+				})
+			}
+		}
+	}
+
+	// Need sort helpers without importing extra packages? We'll implement small ones below.
+	walk(root, nil, 0)
+	return choices
+}
+
+func resolveTreeSelection(missing []missingFile, choices []treeChoice, selectedKeys []string) []missingFile {
+	if len(selectedKeys) == 0 {
+		return nil
+	}
+
+	byKey := make(map[string]treeChoice, len(choices))
+	for _, c := range choices {
+		byKey[c.Key] = c
+	}
+
+	seen := make(map[int]bool, len(missing))
+	selected := make([]missingFile, 0)
+	for _, k := range selectedKeys {
+		c, ok := byKey[k]
+		if !ok {
+			continue
+		}
+		for _, idx := range c.FileIndices {
+			if idx < 0 || idx >= len(missing) || seen[idx] {
+				continue
+			}
+			seen[idx] = true
+			selected = append(selected, missing[idx])
+		}
+	}
+	return selected
+}
+
+func collectAllFileIndices(n *treeNode) []int {
+	out := make([]int, 0)
+	var rec func(cur *treeNode)
+	rec = func(cur *treeNode) {
+		out = append(out, cur.FileIndices...)
+		for _, ch := range cur.Children {
+			rec(ch)
+		}
+	}
+	rec(n)
+	return out
+}
+
+func sortStrings(a []string) {
+	for i := 0; i < len(a); i++ {
+		for j := i + 1; j < len(a); j++ {
+			if a[j] < a[i] {
+				a[i], a[j] = a[j], a[i]
+			}
+		}
+	}
+}
+
+func sortIntsByFileName(idxs []int, missing []missingFile) {
+	for i := 0; i < len(idxs); i++ {
+		for j := i + 1; j < len(idxs); j++ {
+			if missing[idxs[j]].Info.Name() < missing[idxs[i]].Info.Name() {
+				idxs[i], idxs[j] = idxs[j], idxs[i]
+			}
+		}
+	}
 }
 
 // copySelectedToLocal copies the selected missing files to targetDir.
